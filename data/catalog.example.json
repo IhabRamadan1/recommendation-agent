@@ -1,0 +1,50 @@
+[
+  {
+    "id": "career-data-analyst",
+    "title": "Data Analyst",
+    "tags": ["data", "analytics", "sql", "python", "stem"],
+    "score_hint": 0.85
+  },
+  {
+    "id": "career-software-engineer",
+    "title": "Software Engineer",
+    "tags": ["coding", "python", "engineering", "stem", "problem-solving"],
+    "score_hint": 0.9
+  },
+  {
+    "id": "career-ux-designer",
+    "title": "UX Designer",
+    "tags": ["design", "creativity", "research", "communication"],
+    "score_hint": 0.75
+  },
+  {
+    "id": "career-product-manager",
+    "title": "Product Manager",
+    "tags": ["leadership", "communication", "strategy", "business"],
+    "score_hint": 0.8
+  },
+  {
+    "id": "major-computer-science",
+    "title": "Computer Science",
+    "tags": ["stem", "coding", "math", "engineering"],
+    "score_hint": 0.88
+  },
+  {
+    "id": "major-business-admin",
+    "title": "Business Administration",
+    "tags": ["business", "leadership", "strategy", "communication"],
+    "score_hint": 0.7
+  },
+  {
+    "id": "elective-public-speaking",
+    "title": "Public Speaking",
+    "tags": ["communication", "leadership", "soft-skills"],
+    "score_hint": 0.65
+  },
+  {
+    "id": "elective-intro-ml",
+    "title": "Introduction to Machine Learning",
+    "tags": ["data", "python", "stem", "analytics"],
+    "score_hint": 0.82
+  }
+]

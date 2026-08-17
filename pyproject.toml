@@ -1,7 +1,7 @@
 [project]
 name = "recommendation-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "Task 2: LangGraph recommendation graph + hardened async agentic service"
 readme = "README.md"
 authors = [
     { name = "Ihab Ramadan", email = "114080300+IhabRamadan1@users.noreply.github.com" }
@@ -33,3 +33,12 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "ruff>=0.16.3",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"

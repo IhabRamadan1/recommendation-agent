@@ -1,0 +1,24 @@
+[
+   {
+  "id": "profile-creative-leader",
+  "name": "Sam",
+  "interests": ["design", "communication", "creativity", "leadership"],
+  "goals": ["lead teams", "shape user experience"],
+  "level": "graduate"
+},
+  {
+    "id": "profile-stem-builder",
+    "name": "Alex",
+    "interests": ["coding", "python", "data", "stem"],
+    "goals": ["build products", "analyze data"],
+    "level": "undergraduate"
+  },
+ 
+  {
+    "id": "profile-business-track",
+    "name": "Jordan",
+    "interests": ["business", "strategy", "leadership", "communication"],
+    "goals": ["manage products", "grow a company"],
+    "level": "undergraduate"
+  }
+]
