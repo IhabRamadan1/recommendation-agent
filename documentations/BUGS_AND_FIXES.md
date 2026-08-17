@@ -75,7 +75,9 @@ async def agent_invoke(...):
 
 **Why it hurts:** Between `await` points, another coroutine can read/write the same dict. Idempotency guarantees collapse.
 
-**Fix:** `AsyncTTLCache` wraps the store with `asyncio.Lock` for get/set (see `src/agentic_service/cache.py`). Idempotency keys are stored only through that API.
+**Fix:** `AsyncTTLCache` uses a store lock for get/set **and** a **per-key** lock for single-flight `get_or_compute` (see `src/agentic_service/cache.py`). Different keys still run concurrently; the same key computes at most once.
+
+Idempotency is further bound to a **request fingerprint** (canonical JSON hash of the payload). Same key + same payload → replay; same key + different payload → HTTP **409 Conflict**.
 
 ---
 
@@ -83,9 +85,9 @@ async def agent_invoke(...):
 
 Even with a healthy async shell, LLM tool selection is still untrusted:
 
-1. Model returns a tool name + arguments.
-2. Service checks `name in TOOL_SPECS` (allowlist).
-3. Arguments are validated with Pydantic models.
-4. Only then is a real Python function invoked — **no** `eval`, **no** blind `getattr`.
+1. Model returns tool call(s); the service requires **exactly one** call.
+2. Service checks `name in TOOL_SPECS` (allowlist with explicit handlers).
+3. Arguments are validated with Pydantic models (`extra="forbid"`).
+4. Only then is the allowlisted handler invoked — **no** `eval`, **no** blind `getattr`.
 
-Per-request `try/except` isolates failures; `Idempotency-Key` replays cached responses on retries.
+Per-request `try/except` isolates failures; `Idempotency-Key` + fingerprint + per-key single-flight make retries safe.

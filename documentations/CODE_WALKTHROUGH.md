@@ -61,7 +61,7 @@ We intentionally **did not** copy Kafka/Docker from the production repo — out 
 #### `load_catalog`
 
 - Reads JSON from `catalog_path`.
-- On missing file / bad JSON / non-list / empty list → `catalog_ok=False`, empty list, error strings — **no exception escapes**.
+- On missing file / bad JSON / non-list / empty list / **duplicate ids** → `catalog_ok=False`, empty list, error strings — **no exception escapes**.
 - Valid entries become `CatalogItem` dumps; invalid rows are skipped with an error note.
 
 **Business:** Bad reference data must not crash the product; it must fail closed later at validation.  
@@ -70,20 +70,26 @@ We intentionally **did not** copy Kafka/Docker from the production repo — out 
 #### `rank_items`
 
 - Skips if `catalog_ok` is false.
-- Scores each item: `0.7 * tag_overlap_density + 0.3 * score_hint`.
-- Returns top 5 as `RankedItem`s; empty result → `rank_failed=True`.
+- Adapts GraphState → calls **`compute_ranked_items`** (shared pure helper) → returns top 5.
+- Empty result → `rank_failed=True`.
 
 **Business:** Ranking is constrained to the catalog — never invents careers.  
-**Technical:** Deterministic scoring makes tests stable and avoids paying for an LLM on the rank branch (half-day budget + reliability). Overlap density prevents long tag lists from dominating unfairly.
+**Technical:** Deterministic scoring lives in `ranking.py` so narrative and tools cannot drift from the graph node.
 
 #### `write_narrative`
 
-- Needs a ranked set. Because rank and narrative run **in parallel**, this node **recomputes the same deterministic rank** when `ranked_items` is not yet in state.
+- Needs a ranked set. Because rank and narrative run **in parallel**, this node calls **`compute_ranked_items`** (not the `rank_items` LangGraph node) when `ranked_items` is not yet in state.
 - Tries LLM if `OPENAI_API_KEY` is set; otherwise uses a template that only inserts ranked titles.
 - On failure → `narrative_failed=True`, empty narrative.
 
 **Business:** Narrative must not advertise items that were not recommended.  
-**Technical:** Parallelism requires each branch to be self-sufficient; duplicating deterministic rank is cheaper and safer than adding a barrier before narrative.
+**Technical:** Parallelism requires each branch to be self-sufficient; the shared helper (not the LangGraph node) keeps scores identical without a barrier before narrative.
+
+### `ranking.py`
+
+**What:** Pure `compute_ranked_items(profile, catalog, limit=5)` — trait/tag overlap + `score_hint`.
+
+Used by `rank_items`, `write_narrative`, and `score_profile_fit` so the algorithm exists in exactly one place.
 
 #### `merge_branches`
 
@@ -99,9 +105,10 @@ We intentionally **did not** copy Kafka/Docker from the production repo — out 
 
 Checks:
 
-1. `catalog_ok` and non-empty schema-valid catalog.
+1. `catalog_ok` and non-empty schema-valid catalog with **unique ids**.
 2. Rank branch produced a usable list; every ranked id/title matches the catalog.
-3. Narrative is non-empty and does **not** mention titles/ids from the catalog that are outside the ranked set (regex word-boundary style).
+3. `narrative_failed` is treated as an explicit failure (not only empty string).
+4. Narrative is non-empty and does **not** mention titles/ids from the catalog that are outside the ranked set (regex word-boundary style).
 
 **Business:** This is the compliance checkpoint before results are trusted.  
 **Technical:** Keeping validation non-LLM means an adversarial or buggy model cannot grade its own homework.
@@ -136,29 +143,29 @@ Re-exports `build_graph` and `run_recommendation` for clean imports.
 
 ### `cache.py` — `AsyncTTLCache`
 
-**What:** Dict + `asyncio.Lock` + TTL timestamps.
+**What:** Dict + store lock + **per-key** locks + TTL timestamps + `get_or_compute`.
 
 **Business:** Idempotent retries must return the same answer (payment-like semantics for agent side effects).  
-**Technical:** Fixes Bug #3 — no bare shared dict across `await` points. `get` / `set` always take the lock; expired entries are deleted on read.
+**Technical:** Fixes Bug #3 — no bare shared dict across `await` points. Same idempotency key is single-flight; different keys do not share one global compute lock.
 
 ### `tools.py`
 
-**What:** Three real functions + allowlist registry:
+**What:** Three real functions + allowlist registry (`TOOL_SPECS`) as the **single source of truth**:
 
 | Tool | Purpose |
 |------|---------|
 | `lookup_catalog_item` | Fetch one catalog row by id |
-| `score_profile_fit` | Deterministic rank for a profile |
+| `score_profile_fit` | Deterministic rank via `compute_ranked_items` |
 | `summarize_top_items` | Short summary of ranked rows |
 
 `execute_tool(name, arguments, catalog_path=...)`:
 
-1. Reject unknown names.
-2. Validate args with the tool’s Pydantic model.
-3. Dispatch with an explicit `if name == ...` chain (not `getattr`).
+1. Reject unknown names (must be in `TOOL_SPECS`).
+2. Validate args with the tool’s Pydantic model (`extra="forbid"`).
+3. Dispatch via the explicit `handler` on that allowlist entry (not `getattr` / `eval`).
 
 **Business:** The model may *ask* to call something dangerous; the service simply refuses.  
-**Technical:** Allowlist + schema validation is the standard tool-calling safety pattern; avoiding `getattr`/`eval` removes a whole RCE class.
+**Technical:** Allowlist + schema validation is the standard tool-calling safety pattern.
 
 `tool_openai_schemas()` exposes JSON schemas for `bind_tools`.
 
@@ -170,13 +177,19 @@ Re-exports `build_graph` and `run_recommendation` for clean imports.
 |-------|----------|
 | `GET /health` | Liveness |
 | `POST /recommend` | Runs Part A graph via `asyncio.to_thread` (Bug #2 fix) |
-| `POST /agent/invoke` | Allowlisted tool call; optional `Idempotency-Key` header |
+| `POST /agent/invoke` | Allowlisted tool call; fingerprint-bound `Idempotency-Key` |
+
+Idempotency flow:
+
+```text
+Idempotency-Key → request fingerprint → per-key lock → double-check cache → execute once → cache
+```
+
+Same key + different payload → **409 Conflict**. `parse_exactly_one_tool_call` rejects zero or multiple LLM tool calls.
 
 `force_tool` / `force_args` skip the LLM for offline demos and tests while still going through `execute_tool`.
 
-`_select_tool_with_llm` binds only allowlisted schemas, then **re-checks** the returned name ∈ `TOOL_SPECS` before execution.
-
-Per-request `try/except` in the idempotent compute path converts unexpected errors into a structured `ok=False` response (fault isolation).
+Per-request `try/except` isolates unexpected errors (`HTTPException` is re-raised).
 
 **Business:** HTTP is how other services will call recommendations and tools.  
 **Technical:** Correct package imports fix Bug #1; thread offload / async LLM fix Bug #2; cache fixes Bug #3.
@@ -190,6 +203,7 @@ Per-request `try/except` in the idempotent compute path converts unexpected erro
 | `data/catalog.example.json` | Happy-path education/career catalog |
 | `data/catalog.empty.json` | Empty list → fail closed |
 | `data/catalog.malformed.json` | Object instead of list → fail closed |
+| `data/catalog.duplicate_ids.json` | Duplicate ids → fail closed |
 | `data/sample_profiles.json` | Mock trait profiles for demos |
 
 ---
@@ -198,12 +212,13 @@ Per-request `try/except` in the idempotent compute path converts unexpected erro
 
 | File | Proves |
 |------|--------|
-| `test_graph_catalog.py` | Empty/malformed catalog handling |
+| `test_graph_catalog.py` | Empty/malformed/duplicate catalog handling |
 | `test_graph_flow.py` | Happy path, catalog constraint, failed branches |
-| `test_validators.py` | Narrative cannot cite non-ranked catalog items |
-| `test_cache.py` | Async cache get/set / concurrency smoke |
-| `test_tools.py` | Allowlist reject + real tool success paths |
-| `test_api.py` | Health, recommend, idempotent replay, isolation |
+| `test_ranking.py` | Shared `compute_ranked_items` used by nodes |
+| `test_validators.py` | Narrative constraints, `narrative_failed`, duplicate ids |
+| `test_cache.py` | Per-key single-flight; different keys concurrent |
+| `test_tools.py` | Allowlist, `extra=forbid`, shared ranking |
+| `test_api.py` | Idempotent replay, 409 fingerprint mismatch, one tool call |
 | `test_setup.py` | Imports still resolve |
 
 ---

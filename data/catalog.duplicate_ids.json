@@ -1,0 +1,14 @@
+[
+  {
+    "id": "dup-career",
+    "title": "First Career",
+    "tags": ["stem"],
+    "score_hint": 0.9
+  },
+  {
+    "id": "dup-career",
+    "title": "Second Career",
+    "tags": ["design"],
+    "score_hint": 0.8
+  }
+]

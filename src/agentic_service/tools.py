@@ -1,32 +1,39 @@
 """Allowlisted LLM-selectable tools. No eval / blind getattr.
 
 Business: the model proposes a tool; the service decides if it is real and safe.
-Technical: registry maps name → (argument model, callable).
+Technical: TOOL_SPECS is the single source of truth (args model + handler).
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from recommendation_graph.ranking import compute_ranked_items
 from recommendation_graph.state import CatalogItem, UserProfile
-from recommendation_graph.nodes import rank_items
 
 
 class LookupArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     item_id: str = Field(min_length=1)
 
 
 class ScoreFitArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     profile: dict[str, Any]
     catalog_path: str | None = None
 
 
 class SummarizeArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     ranked_items: list[dict[str, Any]] = Field(min_length=1)
 
 
@@ -42,23 +49,27 @@ def lookup_catalog_item(item_id: str, catalog_path: Path) -> dict[str, Any]:
 
 def score_profile_fit(profile: dict[str, Any], catalog_path: Path) -> dict[str, Any]:
     """Run deterministic ranking for a profile against the reference catalog."""
-    UserProfile.model_validate(profile)  # fail fast on bad shape
-    state = {
-        "profile": profile,
-        "catalog_path": str(catalog_path),
-        "catalog": _load_catalog(catalog_path),
-        "catalog_ok": True,
-    }
-    if not state["catalog"]:
-        return {"ok": False, "error": "Catalog empty or unreadable."}
-    # Re-validate catalog_ok after load
     try:
-        state["catalog"] = [CatalogItem.model_validate(c).model_dump() for c in state["catalog"]]
+        user = UserProfile.model_validate(profile)
+        raw_items = _load_catalog(catalog_path)
+        if not raw_items:
+            return {"ok": False, "error": "Catalog empty or unreadable."}
+        catalog = [CatalogItem.model_validate(c) for c in raw_items]
+        top = compute_ranked_items(user, catalog, limit=5)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)}
 
-    ranked = rank_items(state)
-    return {"ok": True, **ranked}
+    if not top:
+        return {
+            "ok": True,
+            "ranked_items": [],
+            "rank_failed": True,
+        }
+    return {
+        "ok": True,
+        "ranked_items": [r.model_dump() for r in top],
+        "rank_failed": False,
+    }
 
 
 def summarize_top_items(ranked_items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -71,33 +82,54 @@ def summarize_top_items(ranked_items: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-ToolHandler = Callable[..., dict[str, Any]]
+ToolHandler = Callable[[BaseModel, Path], dict[str, Any]]
 
 
-class ToolSpec(BaseModel):
+@dataclass(frozen=True)
+class ToolSpec:
+    """Allowlist entry: name, description, args schema, and explicit handler."""
+
     name: str
     description: str
     args_model: type[BaseModel]
+    handler: ToolHandler
 
-    model_config = {"arbitrary_types_allowed": True}
+
+def _handle_lookup(parsed: BaseModel, catalog_path: Path) -> dict[str, Any]:
+    assert isinstance(parsed, LookupArgs)
+    return lookup_catalog_item(parsed.item_id, catalog_path)
 
 
-# Allowlist: only these names may be executed.
+def _handle_score_fit(parsed: BaseModel, catalog_path: Path) -> dict[str, Any]:
+    assert isinstance(parsed, ScoreFitArgs)
+    path = Path(parsed.catalog_path) if parsed.catalog_path else catalog_path
+    return score_profile_fit(parsed.profile, path)
+
+
+def _handle_summarize(parsed: BaseModel, catalog_path: Path) -> dict[str, Any]:
+    assert isinstance(parsed, SummarizeArgs)
+    return summarize_top_items(parsed.ranked_items)
+
+
+# Allowlist: only these names may be executed. Handlers are wired explicitly here.
 TOOL_SPECS: dict[str, ToolSpec] = {
     "lookup_catalog_item": ToolSpec(
         name="lookup_catalog_item",
         description="Look up a single catalog item by its id.",
         args_model=LookupArgs,
+        handler=_handle_lookup,
     ),
     "score_profile_fit": ToolSpec(
         name="score_profile_fit",
         description="Score and rank catalog items for a user trait profile.",
         args_model=ScoreFitArgs,
+        handler=_handle_score_fit,
     ),
     "summarize_top_items": ToolSpec(
         name="summarize_top_items",
         description="Summarize an already ranked list of items.",
         args_model=SummarizeArgs,
+        handler=_handle_summarize,
     ),
 }
 
@@ -108,27 +140,12 @@ def tool_openai_schemas() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
-                "name": "lookup_catalog_item",
-                "description": TOOL_SPECS["lookup_catalog_item"].description,
-                "parameters": LookupArgs.model_json_schema(),
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.args_model.model_json_schema(),
             },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "score_profile_fit",
-                "description": TOOL_SPECS["score_profile_fit"].description,
-                "parameters": ScoreFitArgs.model_json_schema(),
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "summarize_top_items",
-                "description": TOOL_SPECS["summarize_top_items"].description,
-                "parameters": SummarizeArgs.model_json_schema(),
-            },
-        },
+        }
+        for spec in TOOL_SPECS.values()
     ]
 
 
@@ -138,7 +155,7 @@ def execute_tool(
     *,
     catalog_path: Path,
 ) -> dict[str, Any]:
-    """Validate tool name against allowlist, validate args, then execute."""
+    """Validate tool name against allowlist, validate args, then execute handler."""
     if name not in TOOL_SPECS:
         return {
             "ok": False,
@@ -152,19 +169,7 @@ def execute_tool(
     except ValidationError as exc:
         return {"ok": False, "error": f"Invalid arguments for {name}: {exc}"}
 
-    if name == "lookup_catalog_item":
-        assert isinstance(parsed, LookupArgs)
-        return lookup_catalog_item(parsed.item_id, catalog_path)
-    if name == "score_profile_fit":
-        assert isinstance(parsed, ScoreFitArgs)
-        path = Path(parsed.catalog_path) if parsed.catalog_path else catalog_path
-        return score_profile_fit(parsed.profile, path)
-    if name == "summarize_top_items":
-        assert isinstance(parsed, SummarizeArgs)
-        return summarize_top_items(parsed.ranked_items)
-
-    # Unreachable if TOOL_SPECS and branches stay in sync — still fail closed.
-    return {"ok": False, "error": f"No handler wired for allowlisted tool {name!r}."}
+    return spec.handler(parsed, catalog_path)
 
 
 def _load_catalog(catalog_path: Path) -> list[dict[str, Any]]:

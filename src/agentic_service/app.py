@@ -5,12 +5,14 @@ Fixes applied (see documentations/BUGS_AND_FIXES.md):
 2. No sync blocking on the async request path.
 3. Async-safe TTL cache instead of a bare shared dict.
 
-Adds allowlisted LLM tool-calling with per-request isolation and idempotency.
+Adds allowlisted LLM tool-calling with per-request isolation and
+fingerprint-bound per-key single-flight idempotency.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -56,6 +58,58 @@ class AgentInvokeResponse(BaseModel):
     idempotent_replay: bool = False
 
 
+def request_fingerprint(body: AgentInvokeRequest) -> str:
+    """Deterministic hash of the semantically relevant request payload."""
+    payload = {
+        "message": body.message,
+        "force_tool": body.force_tool,
+        "force_args": body.force_args,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def parse_exactly_one_tool_call(response: Any) -> tuple[str, dict[str, Any]]:
+    """Require exactly one tool call from LangChain / OpenAI response shapes.
+
+    Handles both ``response.tool_calls`` and ``additional_kwargs["tool_calls"]``.
+    """
+    tool_calls = list(getattr(response, "tool_calls", None) or [])
+    source = "tool_calls"
+
+    if not tool_calls:
+        additional = getattr(response, "additional_kwargs", {}) or {}
+        tool_calls = list(additional.get("tool_calls") or [])
+        source = "additional_kwargs"
+
+    if len(tool_calls) == 0:
+        raise HTTPException(status_code=400, detail="Model did not select a tool.")
+    if len(tool_calls) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expected exactly one tool call, got {len(tool_calls)}.",
+        )
+
+    first = tool_calls[0]
+    if source == "additional_kwargs" and isinstance(first, dict):
+        name = first.get("function", {}).get("name") or first.get("name")
+        arg_str = first.get("function", {}).get("arguments") or "{}"
+        args = json.loads(arg_str) if isinstance(arg_str, str) else dict(arg_str or {})
+    elif isinstance(first, dict):
+        name = first.get("name")
+        args = dict(first.get("args") or {})
+    else:
+        name = getattr(first, "name", None)
+        args = dict(getattr(first, "args", None) or {})
+
+    if not name or name not in TOOL_SPECS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model selected non-allowlisted tool {name!r}",
+        )
+    return str(name), args
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -87,25 +141,56 @@ async def agent_invoke(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> AgentInvokeResponse:
     """LLM tool-selection (or forced tool) with allowlist validation + idempotency."""
+    fingerprint = request_fingerprint(body)
 
     async def _compute() -> AgentInvokeResponse:
         try:
             return await _run_agent(body)
+        except HTTPException:
+            raise
         except Exception as exc:  # noqa: BLE001 — isolate failure to this request
             return AgentInvokeResponse(ok=False, error=f"Request failed: {exc}")
 
-    if idempotency_key:
-        cached = await _cache.get(idempotency_key)
-        if cached is not None:
-            replay = AgentInvokeResponse.model_validate(cached)
-            replay.idempotent_replay = True
-            return replay
+    if not idempotency_key:
+        return await _compute()
 
+    async def _factory() -> dict[str, Any]:
         result = await _compute()
-        await _cache.set(idempotency_key, result.model_dump())
-        return result
+        return {
+            "request_hash": fingerprint,
+            "response": result.model_dump(),
+        }
 
-    return await _compute()
+    # Fast path: cache hit without taking the per-key lock.
+    cached = await _cache.get(idempotency_key)
+    if cached is not None:
+        return _replay_or_conflict(cached, fingerprint)
+
+    entry, computed = await _cache.get_or_compute(idempotency_key, _factory)
+    # get_or_compute may return an entry produced by another waiter; still check hash.
+    if not computed:
+        return _replay_or_conflict(entry, fingerprint)
+
+    # This caller computed: verify we stored our fingerprint (should match).
+    if entry.get("request_hash") != fingerprint:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency-Key was already used with a different request payload.",
+        )
+    return AgentInvokeResponse.model_validate(entry["response"])
+
+
+def _replay_or_conflict(entry: Any, fingerprint: str) -> AgentInvokeResponse:
+    if not isinstance(entry, dict) or "request_hash" not in entry or "response" not in entry:
+        raise HTTPException(status_code=500, detail="Corrupt idempotency cache entry.")
+    if entry["request_hash"] != fingerprint:
+        raise HTTPException(
+            status_code=409,
+            detail="Idempotency-Key was already used with a different request payload.",
+        )
+    replay = AgentInvokeResponse.model_validate(entry["response"])
+    replay.idempotent_replay = True
+    return replay
 
 
 async def _run_agent(body: AgentInvokeRequest) -> AgentInvokeResponse:
@@ -141,8 +226,6 @@ async def _select_tool_with_llm(message: str) -> tuple[str, dict[str, Any]]:
     """Ask the model to pick one allowlisted tool; validate the name before return."""
     settings = get_settings()
     if not settings.has_openai:
-        # Offline fallback: score_profile_fit with empty-ish defaults is wrong;
-        # instead map to summarize via a tiny heuristic or raise a clear error.
         raise HTTPException(
             status_code=503,
             detail=(
@@ -161,36 +244,9 @@ async def _select_tool_with_llm(message: str) -> tuple[str, dict[str, Any]]:
     )
     llm_with_tools = llm.bind_tools(tool_openai_schemas())
 
-    # asyncio.to_thread if the client is sync; prefer ainvoke when available.
     if hasattr(llm_with_tools, "ainvoke"):
         response = await llm_with_tools.ainvoke(message)
     else:
         response = await asyncio.to_thread(llm_with_tools.invoke, message)
 
-    tool_calls = getattr(response, "tool_calls", None) or []
-    if not tool_calls:
-        # Some versions nest tool calls under additional_kwargs
-        additional = getattr(response, "additional_kwargs", {}) or {}
-        raw_calls = additional.get("tool_calls") or []
-        if raw_calls:
-            first = raw_calls[0]
-            name = first.get("function", {}).get("name") or first.get("name")
-            arg_str = first.get("function", {}).get("arguments") or "{}"
-            args = json.loads(arg_str) if isinstance(arg_str, str) else dict(arg_str)
-            if name not in TOOL_SPECS:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Model selected non-allowlisted tool {name!r}",
-                )
-            return name, args
-        raise HTTPException(status_code=400, detail="Model did not select a tool.")
-
-    first = tool_calls[0]
-    name = first.get("name") if isinstance(first, dict) else getattr(first, "name", None)
-    args = first.get("args") if isinstance(first, dict) else getattr(first, "args", {})
-    if name not in TOOL_SPECS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Model selected non-allowlisted tool {name!r}",
-        )
-    return str(name), dict(args or {})
+    return parse_exactly_one_tool_call(response)

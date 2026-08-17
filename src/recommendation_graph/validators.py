@@ -19,6 +19,7 @@ def validate_recommendation_state(
     ranked_items: list[dict],
     narrative: str,
     rank_failed: bool,
+    narrative_failed: bool = False,
     errors: list[str] | None = None,
 ) -> tuple[bool, list[str]]:
     """Return (passed, messages). Fail closed on empty/malformed catalog or bad refs."""
@@ -37,6 +38,11 @@ def validate_recommendation_state(
     try:
         for raw in catalog:
             item = CatalogItem.model_validate(raw)
+            if item.id in catalog_by_id:
+                messages.append(
+                    f"Duplicate catalog id {item.id!r}; reference data is malformed."
+                )
+                return False, messages
             catalog_by_id[item.id] = item
     except Exception as exc:  # noqa: BLE001 — surface as validation failure
         messages.append(f"Catalog failed schema validation: {exc}")
@@ -44,6 +50,10 @@ def validate_recommendation_state(
 
     if rank_failed or not ranked_items:
         messages.append("Rank branch produced no usable ranked list.")
+        return False, messages
+
+    if narrative_failed:
+        messages.append("Narrative branch failed; validation failed closed.")
         return False, messages
 
     ranked: list[RankedItem] = []

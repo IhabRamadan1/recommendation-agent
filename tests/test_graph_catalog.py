@@ -44,3 +44,18 @@ def test_graph_fails_closed_on_malformed_catalog() -> None:
     result = run_recommendation(PROFILE, REPO / "data" / "catalog.malformed.json")
     assert result["validation_passed"] is False
     assert result["catalog_ok"] is False
+
+
+def test_load_rejects_duplicate_catalog_ids() -> None:
+    state = load_catalog(
+        {"catalog_path": str(REPO / "data" / "catalog.duplicate_ids.json")}
+    )
+    assert state["catalog_ok"] is False
+    assert state["catalog"] == []
+    assert any("duplicate catalog id" in e.lower() for e in state["errors"])
+
+
+def test_graph_fails_closed_on_duplicate_catalog_ids() -> None:
+    result = run_recommendation(PROFILE, REPO / "data" / "catalog.duplicate_ids.json")
+    assert result["validation_passed"] is False
+    assert result["catalog_ok"] is False

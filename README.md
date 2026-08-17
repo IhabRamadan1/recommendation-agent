@@ -146,6 +146,10 @@ Optional: `"catalog_path": "data/catalog.empty.json"` to demo fail-closed behavi
 
 Add header `Idempotency-Key: demo-1`, execute twice — second response should set `"idempotent_replay": true`.
 
+Same key with a **different body** returns **HTTP 409 Conflict** (fingerprint mismatch).
+
+Concurrent retries with the same key are **single-flight** (underlying work runs once).
+
 ### `POST /agent/invoke` (live LLM tool selection)
 
 1. Set `OPENAI_API_KEY` in `.env`
@@ -166,17 +170,18 @@ Diagram: [diagrams/sequence_diagram.md](diagrams/sequence_diagram.md)
 ```text
 recommendation-agent/
 ├── data/
-│   ├── catalog.example.json      # happy-path reference catalog
-│   ├── catalog.empty.json        # fail-closed fixture
-│   ├── catalog.malformed.json    # fail-closed fixture
-│   └── sample_profiles.json      # Alex / Sam / Jordan
-├── diagrams/                     # mermaid workflow + sequence
-├── documentations/               # business, bugs, code walkthrough
+│   ├── catalog.example.json         # happy-path reference catalog
+│   ├── catalog.empty.json           # fail-closed fixture
+│   ├── catalog.malformed.json       # fail-closed fixture
+│   ├── catalog.duplicate_ids.json   # fail-closed fixture
+│   └── sample_profiles.json         # Alex / Sam / Jordan
+├── diagrams/                        # mermaid workflow + sequence
+├── documentations/                  # business, bugs, code walkthrough
 ├── src/
-│   ├── config/                   # settings from .env
-│   ├── recommendation_agent/     # CLI entrypoint
-│   ├── recommendation_graph/     # Part A (state, nodes, graph, validators)
-│   └── agentic_service/          # Part B (app, cache, tools)
+│   ├── config/                      # settings from .env
+│   ├── recommendation_agent/        # CLI entrypoint
+│   ├── recommendation_graph/        # Part A (state, ranking, nodes, graph, validators)
+│   └── agentic_service/             # Part B (app, cache, tools)
 ├── tests/
 ├── .env.example
 ├── pyproject.toml
@@ -206,7 +211,7 @@ Without an API key, Part A still works (template narrative) and Part B works via
 uv run pytest -q
 ```
 
-Coverage includes: empty/malformed catalog, parallel graph + failed branches, validator rules, async cache, tool allowlist, API idempotency, and fault isolation.
+Coverage includes: empty/malformed/duplicate catalog, parallel graph + failed branches, shared ranking helper, validator rules (`narrative_failed`), per-key single-flight cache, strict tool args, exactly-one tool call, fingerprint 409 conflicts, and fault isolation.
 
 ---
 
@@ -227,10 +232,11 @@ Coverage includes: empty/malformed catalog, parallel graph + failed branches, va
 | Skill | Where it shows up |
 |-------|-------------------|
 | LangGraph orchestration | Parallel rank + narrative, merge, validate |
-| Deterministic validation | `validators.py` — no LLM in the gate |
-| Async debugging | Import path, non-blocking handlers, lock-safe cache |
-| Safe tool-calling | Allowlist + Pydantic args before execute |
-| Isolation + idempotency | Per-request errors; `Idempotency-Key` replay |
+| Deterministic validation | `validators.py` — no LLM in the gate; duplicate ids / `narrative_failed` |
+| Shared domain ranking | `ranking.compute_ranked_items` used by graph + tools |
+| Async debugging | Import path, non-blocking handlers, per-key cache locks |
+| Safe tool-calling | Allowlist handlers + `extra="forbid"` args; exactly one tool call |
+| Isolation + idempotency | Per-request errors; fingerprint + single-flight `Idempotency-Key` |
 
 ---
 
